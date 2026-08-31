@@ -1,0 +1,101 @@
+name: CD - Release (Build & Deploy Staging)
+
+# Once develop is ready to ship, a release/v<version> branch is cut from
+# develop by hand (e.g. release/v1.0.0). That push builds ONE image
+# tagged with the version taken from the branch name, and deploys it
+# straight to Staging for UAT. The pipeline stops here - promotion to
+# Production is a separate, manually-triggered workflow
+# (promote-to-production.yml) run from the Actions tab, since this
+# repo's GitHub plan doesn't support native Environment "Required
+# reviewers".
+
+on:
+  push:
+    branches:
+      - "release/v*"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Version comes from the branch name, not from a build counter.
+  # release/v1.0.0 -> 1.0.0
+  # ---------------------------------------------------------------------
+  extract-version:
+    name: Extract Version from Branch Name
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Parse release/v<version>
+        id: extract
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          VERSION="${BRANCH#release/v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Branch '${BRANCH}' does not match release/vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Build once from the release branch, tagged with its Semantic Version.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build & Push Release Image
+    needs: extract-version
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag and push image
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+          VERSION: ${{ needs.extract-version.outputs.version }}
+        run: |
+          IMAGE_URI="${ECR_REGISTRY}/${{ vars.ECR_REPOSITORY }}:${VERSION}"
+          docker build -t "${IMAGE_URI}" .
+          docker push "${IMAGE_URI}"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: echo "### Published \`${{ steps.image.outputs.image_uri }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------
+  # Deploy/UAT are commented out until the ECS cluster exists - for now
+  # this workflow only verifies the build. Uncomment both jobs once
+  # staging's ECS cluster/service/task-definition are set up.
+  # ---------------------------------------------------------------------
+  # deploy-staging:
+  #   name: Deploy to Staging
+  #   needs: build
+  #   uses: ./.github/workflows/deploy-template.yml
+  #   with:
+  #     environment: staging
+  #     image_uri: ${{ needs.build.outputs.image_uri }}
+  #   secrets: inherit
+
+  # uat-validation:
+  #   name: UAT Validation
+  #   needs: deploy-staging
+  #   runs-on: ubuntu-latest
+  #   environment: staging
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Run UAT validation suite
+  #       run: ./scripts/uat_validation.sh staging "${{ vars.APP_URL }}"
