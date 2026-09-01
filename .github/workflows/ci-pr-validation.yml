@@ -104,7 +104,9 @@ jobs:
       - name: Download jeavio-governance script from CodeArtifact
         run: |
           latest_version=$(aws codeartifact list-package-versions --domain jeavio-governance --repository jeavio-governance --format generic --namespace jeavio-governance --package jeavio-governance --query 'versions[-1].version' --output text)
-          aws codeartifact get-package-version-asset --domain jeavio-governance --repository jeavio-governance --format generic --namespace jeavio-governance --package jeavio-governance --package-version "$latest_version" --asset jeavio-governance.sh jeavio-governance
+          aws codeartifact get-package-version-asset --domain jeavio-governance --repository jeavio-governance --format generic --namespace jeavio-governance --package jeavio-governance --package-version "$latest_version" --asset governance.zip governance.zip
+          unzip -o governance.zip jeavio-governance.sh
+          mv jeavio-governance.sh jeavio-governance
           chmod +x jeavio-governance
 
       - name: Upload governance tool artifact
