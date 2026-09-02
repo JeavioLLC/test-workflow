@@ -64,28 +64,11 @@ jobs:
             echo "::notice::Development currently has '${CURRENT}' deployed, which differs from the tag you're promoting. This is expected if Development has since moved on to someone else's build - double check you meant to promote your own tested image."
           fi
 
-  # ---------------------------------------------------------------------
-  # Deploy/QA-test are commented out until the ECS cluster exists.
-  # Uncomment both jobs once qa's ECS cluster/service/task-definition
-  # are set up (this workflow is manual-only anyway, so it won't run
-  # until someone dispatches it - commented out for consistency with the
-  # other pipelines while there's no cluster to deploy to).
-  # ---------------------------------------------------------------------
-  # deploy-qa:
-  #   name: Deploy to QA
-  #   needs: resolve-image
-  #   uses: ./.github/workflows/deploy-template.yml
-  #   with:
-  #     environment: qa
-  #     image_uri: ${{ needs.resolve-image.outputs.image_uri }}
-  #   secrets: inherit
-
-  # qa-testing:
-  #   name: QA Testing
-  #   needs: deploy-qa
-  #   runs-on: ubuntu-latest
-  #   environment: qa
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Run QA test suite
-  #       run: ./scripts/qa_test.sh qa "${{ vars.APP_URL }}"
+  deploy-qa:
+    name: Deploy to QA
+    needs: resolve-image
+    uses: ./.github/workflows/deploy-template.yml
+    with:
+      environment: qa
+      image_uri: ${{ needs.resolve-image.outputs.image_uri }}
+    secrets: inherit
