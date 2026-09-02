@@ -76,26 +76,11 @@ jobs:
       - name: Summary
         run: echo "### Published \`${{ steps.image.outputs.image_uri }}\`" >> "$GITHUB_STEP_SUMMARY"
 
-  # ---------------------------------------------------------------------
-  # Deploy/UAT are commented out until the ECS cluster exists - for now
-  # this workflow only verifies the build. Uncomment both jobs once
-  # staging's ECS cluster/service/task-definition are set up.
-  # ---------------------------------------------------------------------
-  # deploy-staging:
-  #   name: Deploy to Staging
-  #   needs: build
-  #   uses: ./.github/workflows/deploy-template.yml
-  #   with:
-  #     environment: staging
-  #     image_uri: ${{ needs.build.outputs.image_uri }}
-  #   secrets: inherit
-
-  # uat-validation:
-  #   name: UAT Validation
-  #   needs: deploy-staging
-  #   runs-on: ubuntu-latest
-  #   environment: staging
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Run UAT validation suite
-  #       run: ./scripts/uat_validation.sh staging "${{ vars.APP_URL }}"
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    uses: ./.github/workflows/deploy-template.yml
+    with:
+      environment: staging
+      image_uri: ${{ needs.build.outputs.image_uri }}
+    secrets: inherit

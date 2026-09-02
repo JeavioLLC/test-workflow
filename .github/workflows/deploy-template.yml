@@ -30,11 +30,9 @@ name: Deploy Template (ECS Fargate)
 #      service genuinely is stable, just back on the old revision - and
 #      fails this job loudly so it isn't mistaken for a successful
 #      deploy.
-#   3. `previous_task_definition` is still exposed as an output for the
-#      app-level rollback job in promote-to-production.yml, which
-#      catches failures the circuit breaker can't see - e.g. containers
-#      pass ECS/load-balancer health checks but our own health_check.sh
-#      finds a business-logic problem after the deploy already succeeded.
+#   3. `previous_task_definition` is still exposed as an output so the
+#      rollback job in promote-to-production.yml can force-redeploy it
+#      if the deploy job itself fails for any other reason.
 
 on:
   workflow_call:

@@ -7,10 +7,10 @@ Implements the CI/CD & Software Delivery Framework (`CI_CD Framework.docx`) for 
 | Workflow                     | Trigger                                        | Purpose                                                                                   |
 | ----------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
 | `ci-pr-validation.yml`        | Pull request → `develop`, `main`, `release/**`  | Lint, unit tests + 80% coverage, secret/SAST/dependency/license gates (via jeavio-governance) |
-| `cd-develop.yml`              | Push to `develop`                               | Build one image, deploy to Development, smoke test. Stops here.                           |
-| `promote-to-qa.yml`           | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact image tag you name to QA, unchanged. QA test.          |
-| `cd-release.yml`              | Push to `release/v*`                            | Version taken from branch name, build one image, deploy to Staging, UAT. Stops here.      |
-| `promote-to-production.yml`   | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact version you name to Production, unchanged. Health check + automated rollback. |
+| `cd-develop.yml`              | Push to `develop`                               | Build one image, deploy to Development. Stops here.                                       |
+| `promote-to-qa.yml`           | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact image tag you name to QA, unchanged.                   |
+| `cd-release.yml`              | Push to `release/v*`                            | Version taken from branch name, build one image, deploy to Staging. Stops here.           |
+| `promote-to-production.yml`   | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact version you name to Production, unchanged. Automated rollback on failure. |
 | `deploy-template.yml`         | Called by every workflow above                 | Shared ECS Fargate deploy step, reused unchanged per environment                          |
 
 ### Flow
@@ -19,12 +19,12 @@ Implements the CI/CD & Software Delivery Framework (`CI_CD Framework.docx`) for 
 feature/*  --PR-->  develop
                        │  (push)
                        ▼
-       cd-develop.yml: build image dev-<sha>  ->  Deploy Dev  ->  Smoke Test   [stops]
+       cd-develop.yml: build image dev-<sha>  ->  Deploy Dev   [stops]
 
                        │  someone runs promote-to-qa.yml by hand,
                        │  naming the exact dev-<sha> tag they tested
                        ▼        (this manual trigger IS the approval)
-                  Deploy QA  ->  QA Testing
+                  Deploy QA
 
 
 develop  --(cut by hand)-->  release/v1.0.0
@@ -33,12 +33,12 @@ develop  --(cut by hand)-->  release/v1.0.0
    cd-release.yml: version = "1.0.0" from branch name
                        │
                        ▼
-       build image:1.0.0  ->  Deploy Staging  ->  UAT Validation   [stops]
+       build image:1.0.0  ->  Deploy Staging   [stops]
 
                        │  someone runs promote-to-production.yml by hand,
                        │  naming the exact version they validated
                        ▼        (this manual trigger IS the approval)
-              Deploy Production  ->  Health Check  ->  Rollback (on failure)
+              Deploy Production  ->  Rollback (on failure)
 ```
 
 No image is ever rebuilt between stages (Build Once, Deploy Anywhere): `cd-develop.yml` builds once for Development, and `promote-to-qa.yml` redeploys that exact image to QA; `cd-release.yml` builds once (tagged with the version from the release branch name) for Staging, and `promote-to-production.yml` redeploys that exact image to Production.
@@ -64,7 +64,7 @@ So promotion is a **separate, manually-triggered workflow** instead of a pause m
 1. **ECR repository**: create one repository (e.g. `my-app`) that holds every tag — `dev-<sha>` from develop builds and `<major>.<minor>.<patch>` from release builds.
 2. **ECS Fargate**: a cluster, service and task definition must already exist per environment (development/qa/staging/production) before the first deploy — the pipeline updates the image on an existing task definition/service, it does not provision infrastructure.
 3. **GitHub Environments** (Settings → Environments): create `development`, `qa`, `staging`, `production`. On each, set:
-   - Variables: `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION_FAMILY`, `CONTAINER_NAME`, `APP_URL` (the base URL of that environment, e.g. an ALB DNS name — used by `smoke_test.sh`/`qa_test.sh`/`uat_validation.sh`/`health_check.sh` to call `/health`, `/`, `/items`)
+   - Variables: `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION_FAMILY`, `CONTAINER_NAME`, `APP_URL` (the base URL of that environment, e.g. an ALB DNS name)
    - Secret: `AWS_ROLE_ARN` — an IAM role (OIDC, via `aws-actions/configure-aws-credentials`) scoped to that environment's ECS/SSM resources
 4. **Repository-level** (not environment-scoped) config, used by the build steps and by the promote workflows' image-resolution step:
    - Variables: `AWS_REGION`, `ECR_REPOSITORY`, `APP_NAME`
@@ -76,10 +76,10 @@ So promotion is a **separate, manually-triggered workflow** instead of a pause m
    - Variable (optional): `GOVERNANCE_AWS_REGION` — defaults to `ap-south-1` if unset.
    - Variable (optional): `PIP_VERSION` — pip version reported in the license scan; defaults to `24.0` if unset.
 
-## Rollback (two layers)
+## Rollback
 
 1. **ECS Deployment Circuit Breaker** — `deploy-template.yml` enables this on the service before every deploy (`deploymentCircuitBreaker: {enable: true, rollback: true}`). If the new tasks never reach a healthy steady state (crash-looping, failing ELB/container health checks), ECS itself detects this and automatically reverts the service to the previous task definition — no scripting involved, happens within the deploy. Because `aws ecs wait services-stable` reports success even in this case (the service genuinely is stable, just on the old revision), a follow-up "Verify deployment did not auto-rollback" step compares the post-deploy task definition against the one captured before the deploy and fails the job loudly if ECS silently reverted it.
-2. **Health-check-driven rollback** (`promote-to-production.yml`'s `rollback` job) — catches what the circuit breaker can't see: the new tasks pass ECS/load-balancer health checks (so layer 1 sees a "successful" deploy), but `health_check.sh` finds an application-level problem afterward. This job then explicitly redeploys the `previous_task_definition` captured by `deploy-template.yml`.
+2. **Automated rollback job** (`promote-to-production.yml`'s `rollback`) — if the `deploy-production` job fails for any reason, this job force-redeploys the `previous_task_definition` captured by `deploy-template.yml`.
 
 ## Traceability: "current version per environment"
 
@@ -96,12 +96,3 @@ Every deploy (`deploy-template.yml`) writes the deployed image URI to SSM Parame
 - `TECH_STACK`/`TECH_DOMAIN` in each job's generated `config.env` assume this is a Python (`web`) project — adjust if that changes.
 - **Caveat**: every scan is a full-tree scan of whatever `actions/checkout` pulled down (the whole PR branch) — there's no diff-only/incremental mode in this tool (confirmed: no `git diff`, no SonarQube PR-decoration params anywhere in `sast-automation/`). A PR can fail this gate on a pre-existing issue it didn't introduce, not just on newly introduced ones.
 - **Caveat**: `secret-detection-reports` can contain the actual secret values `detect-secrets` found — anyone with repo/Actions read access can download that artifact. Tighten retention or restrict repo visibility if that's a concern.
-
-## Test/verification scripts
-
-`scripts/*.sh` exercise the sample app's `/health`, `/`, and `/items` endpoints over HTTP (`curl` against `<environment>`'s `APP_URL`). Replace/extend them with your real application's checks when this stops being a sample app:
-
-- `smoke_test.sh <environment> <base_url>` — run after Development deploy: `/health` + `/`
-- `qa_test.sh <environment> <base_url>` — run after QA deploy: create/list `/items`, plus a validation-rejection case
-- `uat_validation.sh <environment> <base_url>` — run after Staging deploy: an end-to-end create-then-list flow
-- `health_check.sh <environment> <base_url>` — run after Production deploy: retries `/health` with backoff; a non-zero exit triggers the automated rollback

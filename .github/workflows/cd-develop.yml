@@ -61,26 +61,11 @@ jobs:
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------
-  # Deploy/smoke-test are commented out until the ECS cluster exists -
-  # for now this workflow only verifies the build. Uncomment both jobs
-  # once development's ECS cluster/service/task-definition are set up.
-  # ---------------------------------------------------------------------
-  # deploy-dev:
-  #   name: Deploy to Development
-  #   needs: build
-  #   uses: ./.github/workflows/deploy-template.yml
-  #   with:
-  #     environment: development
-  #     image_uri: ${{ needs.build.outputs.image_uri }}
-  #   secrets: inherit
-
-  # smoke-test:
-  #   name: Smoke Testing
-  #   needs: deploy-dev
-  #   runs-on: ubuntu-latest
-  #   environment: development
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - name: Run smoke tests
-  #       run: ./scripts/smoke_test.sh development "${{ vars.APP_URL }}"
+  deploy-dev:
+    name: Deploy to Development
+    needs: build
+    uses: ./.github/workflows/deploy-template.yml
+    with:
+      environment: development
+      image_uri: ${{ needs.build.outputs.image_uri }}
+    secrets: inherit
