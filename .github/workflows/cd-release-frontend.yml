@@ -1,0 +1,93 @@
+name: CD - Release Frontend (Build & Deploy Staging)
+
+# Frontend counterpart of cd-release.yml. Once develop is ready to ship,
+# a release/v<version> branch is cut from develop by hand. That push
+# builds ONE static bundle tagged with the version taken from the branch
+# name, and deploys it straight to Staging for UAT. The pipeline stops
+# here - promotion to Production is a separate, manually-triggered
+# workflow (promote-to-production-frontend.yml).
+
+on:
+  push:
+    branches:
+      - "release/v*"
+    paths:
+      - "frontend/**"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Version comes from the branch name, not from a build counter.
+  # release/v1.0.0 -> 1.0.0
+  # ---------------------------------------------------------------------
+  extract-version:
+    name: Extract Version from Branch Name
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract.outputs.version }}
+    steps:
+      - name: Parse release/v<version>
+        id: extract
+        run: |
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          VERSION="${BRANCH#release/v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Branch '${BRANCH}' does not match release/vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------
+  # Build once from the release branch, tagged with its Semantic Version.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build & Upload Release Build
+    needs: extract-version
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.upload.outputs.build_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload build to artifacts bucket
+        id: upload
+        env:
+          VERSION: ${{ needs.extract-version.outputs.version }}
+        run: |
+          aws s3 sync frontend/dist/ "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${VERSION}/"
+          echo "build_tag=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: echo "### Published frontend build \`${{ steps.upload.outputs.build_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build
+    uses: ./.github/workflows/deploy-template-frontend.yml
+    with:
+      environment: staging
+      build_tag: ${{ needs.build.outputs.build_tag }}
+    secrets: inherit

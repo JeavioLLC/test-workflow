@@ -1,0 +1,380 @@
+name: CI - PR Validation (Frontend)
+
+# Frontend counterpart of ci-pr-validation.yml (Section 2 / Table 2 of the
+# CI/CD Framework): every Pull Request into develop or main that touches
+# frontend/ must pass these quality & security gates before it can be
+# merged. Same gate structure as the backend workflow - lint, unit tests
+# + coverage, and the shared jeavio-governance secret/SAST/dependency/
+# license scans - just pointed at the React app instead of the Python one.
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - main
+      - "release/**"
+    paths:
+      - "frontend/**"
+      - ".github/workflows/ci-pr-validation-frontend.yml"
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: ${{ vars.NODE_VERSION || '20' }}
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Linting & Style Checks
+  # ---------------------------------------------------------------------
+  lint:
+    name: Linting & Style Checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Determine changed frontend files
+        id: changed-files
+        run: |
+          git diff --name-only --diff-filter=ACMR \
+            "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+            -- 'frontend/**/*.js' 'frontend/**/*.jsx' \
+            | sed 's#^frontend/##' > changed_files.txt
+          echo "Changed frontend files:"
+          cat changed_files.txt
+          echo "count=$(wc -l < changed_files.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run eslint
+        if: steps.changed-files.outputs.count != '0'
+        working-directory: frontend
+        run: xargs -a ../changed_files.txt npx eslint
+
+  # ---------------------------------------------------------------------
+  # Unit Tests & Code Coverage (threshold set by the COVERAGE_THRESHOLD
+  # repo/org variable, same one the backend job uses - defaults to 80).
+  # ---------------------------------------------------------------------
+  test:
+    name: Unit Tests & Code Coverage
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_THRESHOLD: ${{ vars.COVERAGE_THRESHOLD || '80' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run unit tests with coverage
+        working-directory: frontend
+        run: |
+          echo "Enforcing minimum coverage: ${COVERAGE_THRESHOLD}%"
+          npx vitest run --coverage \
+            --coverage.thresholds.lines="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.functions="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.branches="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.statements="${COVERAGE_THRESHOLD}"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report-frontend
+          path: frontend/coverage/
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Prepare Jeavio Governance Tool (same shared tool as the backend
+  # workflow - fetched independently here since GitHub Actions artifacts
+  # don't cross workflow files, even within the same PR).
+  # ---------------------------------------------------------------------
+  prepare-governance-tool:
+    name: Prepare Jeavio Governance Tool
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GOVERNANCE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.GOVERNANCE_AWS_REGION || 'ap-south-1' }}
+
+      - name: Download jeavio-governance script from CodeArtifact
+        run: |
+          latest_version=$(aws codeartifact list-package-versions --domain jeavio-governance --repository jeavio-governance --format generic --namespace jeavio-governance --package jeavio-governance --query 'versions[-1].version' --output text)
+          aws codeartifact get-package-version-asset --domain jeavio-governance --repository jeavio-governance --format generic --namespace jeavio-governance --package jeavio-governance --package-version "$latest_version" --asset governance.zip governance.zip
+          unzip -o governance.zip jeavio-governance.sh
+          mv jeavio-governance.sh jeavio-governance
+          chmod +x jeavio-governance
+
+      - name: Upload governance tool artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jeavio-governance-tool-frontend
+          path: jeavio-governance
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # Secret Detection - jeavio-governance --scan (TEST_TYPE=detect-secrets)
+  # ---------------------------------------------------------------------
+  secret-detection:
+    name: Secret Detection
+    runs-on: ubuntu-latest
+    needs: prepare-governance-tool
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jeavio-governance tool
+        uses: actions/download-artifact@v4
+        with:
+          name: jeavio-governance-tool-frontend
+          path: ${{ runner.temp }}/governance-tool
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GOVERNANCE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.GOVERNANCE_AWS_REGION || 'ap-south-1' }}
+
+      - name: Setup governance directories
+        run: |
+          chmod +x "${RUNNER_TEMP}/governance-tool/jeavio-governance"
+          "${RUNNER_TEMP}/governance-tool/jeavio-governance" --setup --ci
+          echo "HOME=${HOME}" >> "$GITHUB_ENV"
+
+      - name: Generate config.env
+        run: |
+          cat > ~/jeavio-governance/config/config.env <<EOF
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
+          TECH_DOMAIN=web
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
+          TEST_TYPE=detect-secrets
+          NUMBER_OF_LOG_FILES_TO_KEEP=3
+          EOF
+
+      - name: Run secret detection scan
+        run: '"${RUNNER_TEMP}/governance-tool/jeavio-governance" --scan --ci'
+
+      - name: Upload secret detection reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-detection-reports-frontend
+          path: ${{ env.HOME }}/jeavio-governance/sast-reports
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Static Application Security Testing (SAST)
+  # jeavio-governance --scan (TEST_TYPE=source-code-sast)
+  # ---------------------------------------------------------------------
+  sast-scan:
+    name: SAST Scan
+    runs-on: ubuntu-latest
+    needs: prepare-governance-tool
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jeavio-governance tool
+        uses: actions/download-artifact@v4
+        with:
+          name: jeavio-governance-tool-frontend
+          path: ${{ runner.temp }}/governance-tool
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GOVERNANCE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.GOVERNANCE_AWS_REGION || 'ap-south-1' }}
+
+      - name: Setup governance directories
+        run: |
+          chmod +x "${RUNNER_TEMP}/governance-tool/jeavio-governance"
+          "${RUNNER_TEMP}/governance-tool/jeavio-governance" --setup --ci
+          echo "HOME=${HOME}" >> "$GITHUB_ENV"
+
+      - name: Generate config.env
+        run: |
+          cat > ~/jeavio-governance/config/config.env <<EOF
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
+          TECH_DOMAIN=web
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
+          TEST_TYPE=source-code-sast
+          NUMBER_OF_LOG_FILES_TO_KEEP=3
+          EOF
+
+      - name: Run SAST scan
+        run: '"${RUNNER_TEMP}/governance-tool/jeavio-governance" --scan --ci'
+
+      - name: Upload SAST reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-scan-reports-frontend
+          path: ${{ env.HOME }}/jeavio-governance/sast-reports
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Dependency Vulnerability Scan
+  # jeavio-governance --scan (TEST_TYPE=dependency-vuln)
+  # ---------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: prepare-governance-tool
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jeavio-governance tool
+        uses: actions/download-artifact@v4
+        with:
+          name: jeavio-governance-tool-frontend
+          path: ${{ runner.temp }}/governance-tool
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GOVERNANCE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.GOVERNANCE_AWS_REGION || 'ap-south-1' }}
+
+      - name: Setup governance directories
+        run: |
+          chmod +x "${RUNNER_TEMP}/governance-tool/jeavio-governance"
+          "${RUNNER_TEMP}/governance-tool/jeavio-governance" --setup --ci
+          echo "HOME=${HOME}" >> "$GITHUB_ENV"
+
+      - name: Generate config.env
+        run: |
+          cat > ~/jeavio-governance/config/config.env <<EOF
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
+          TECH_DOMAIN=web
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
+          TEST_TYPE=dependency-vuln
+          NUMBER_OF_LOG_FILES_TO_KEEP=3
+          EOF
+
+      - name: Run dependency vulnerability scan
+        run: '"${RUNNER_TEMP}/governance-tool/jeavio-governance" --scan --ci'
+
+      - name: Upload dependency scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-reports-frontend
+          path: ${{ env.HOME }}/jeavio-governance/sast-reports
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # License Compliance Scan
+  # jeavio-governance --scan (TEST_TYPE=dependency-license)
+  # Note: PACKAGE_MANAGER_VERSION is only required by the tool when
+  # TECH_STACK=python - not needed here for javascript.
+  # ---------------------------------------------------------------------
+  license-scan:
+    name: License Compliance Scan
+    runs-on: ubuntu-latest
+    needs: prepare-governance-tool
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jeavio-governance tool
+        uses: actions/download-artifact@v4
+        with:
+          name: jeavio-governance-tool-frontend
+          path: ${{ runner.temp }}/governance-tool
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.GOVERNANCE_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.GOVERNANCE_AWS_REGION || 'ap-south-1' }}
+
+      - name: Setup governance directories
+        run: |
+          chmod +x "${RUNNER_TEMP}/governance-tool/jeavio-governance"
+          "${RUNNER_TEMP}/governance-tool/jeavio-governance" --setup --ci
+          echo "HOME=${HOME}" >> "$GITHUB_ENV"
+
+      - name: Generate config.env
+        run: |
+          cat > ~/jeavio-governance/config/config.env <<EOF
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
+          TECH_DOMAIN=web
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
+          TEST_TYPE=dependency-license
+          NUMBER_OF_LOG_FILES_TO_KEEP=3
+          EOF
+
+      - name: Run license compliance scan
+        run: '"${RUNNER_TEMP}/governance-tool/jeavio-governance" --scan --ci'
+
+      - name: Upload license scan reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: license-scan-reports-frontend
+          path: ${{ env.HOME }}/jeavio-governance/sast-reports
+          retention-days: 14
+
+  # ---------------------------------------------------------------------
+  # Quality Gate - fails the PR if any mandatory check above failed.
+  # ---------------------------------------------------------------------
+  quality-gate:
+    name: Quality Gate
+    if: always()
+    needs:
+      - lint
+      - test
+      - prepare-governance-tool
+      - secret-detection
+      - sast-scan
+      - dependency-scan
+      - license-scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate gate results
+        run: |
+          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" || "${{ contains(needs.*.result, 'cancelled') }}" == "true" || "${{ contains(needs.*.result, 'skipped') }}" == "true" ]]; then
+            echo "One or more mandatory checks failed (or were skipped due to an upstream failure). Blocking merge."
+            exit 1
+          fi
+          echo "All quality & security gates passed."

@@ -1,0 +1,77 @@
+name: CD - Develop Frontend (Build & Deploy Dev)
+
+# Frontend counterpart of cd-develop.yml. Feature branches merge into
+# `develop`. As soon as frontend code lands on develop we build ONE
+# static bundle and deploy it straight to Development for dev testing.
+# The pipeline stops here - promotion to QA is a separate,
+# manually-triggered workflow (promote-to-qa-frontend.yml), same
+# reasoning as the backend pipeline (no native Environment "Required
+# reviewers" on this GitHub plan).
+#
+# Development is a SHARED environment, same caveat as the backend: a
+# second merge's deploy-dev here will redeploy Development on top of
+# whoever is still testing. `concurrency` below only prevents two
+# deploys from racing each other technically, not this overwrite.
+
+on:
+  push:
+    branches:
+      - develop
+    paths:
+      - "frontend/**"
+
+concurrency:
+  group: deploy-development-frontend
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build & Upload Frontend Build (develop)
+    runs-on: ubuntu-latest
+    outputs:
+      build_tag: ${{ steps.upload.outputs.build_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ vars.NODE_VERSION || '20' }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload build to artifacts bucket
+        id: upload
+        run: |
+          BUILD_TAG="dev-$(git rev-parse --short HEAD)"
+          aws s3 sync frontend/dist/ "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${BUILD_TAG}/"
+          echo "build_tag=${BUILD_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Summary
+        run: echo "### Published frontend build \`${{ steps.upload.outputs.build_tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dev:
+    name: Deploy to Development
+    needs: build
+    uses: ./.github/workflows/deploy-template-frontend.yml
+    with:
+      environment: development
+      build_tag: ${{ needs.build.outputs.build_tag }}
+    secrets: inherit

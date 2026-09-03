@@ -1,0 +1,61 @@
+name: Promote - Deploy Frontend to QA
+
+# Frontend counterpart of promote-to-qa.yml. Manual promotion step, run
+# from the Actions tab ("Run workflow"). Triggering this IS the
+# developer's approval, same reasoning as the backend pipeline.
+#
+# build_tag is REQUIRED and must name the exact build you tested - it is
+# never inferred from "whatever is currently deployed to Development".
+# Find your tag from the cd-develop-frontend.yml run for your merge
+# commit (format: dev-<short-sha>, shown in its "Build & Upload Frontend
+# Build" step summary). No rebuild happens - the exact build you name is
+# deployed unchanged.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: "Exact build tag you tested in Development, e.g. dev-a1b2c3d (NOT left blank / NOT assumed)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-build:
+    name: Verify Build to Promote
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify build exists in artifacts bucket
+        run: |
+          if ! aws s3 ls "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${{ inputs.build_tag }}/" > /dev/null; then
+            echo "::error::No build found at tag '${{ inputs.build_tag }}'. Check the tag from your cd-develop-frontend.yml run's Build step summary."
+            exit 1
+          fi
+          echo "Promoting build ${{ inputs.build_tag }}"
+
+      - name: Sanity check against current Development deployment
+        run: |
+          CURRENT=$(aws ssm get-parameter \
+            --name "/${{ vars.APP_NAME }}/development/frontend/current-build" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "unknown")
+          if [ "${CURRENT}" != "${{ inputs.build_tag }}" ]; then
+            echo "::notice::Development currently has build '${CURRENT}' deployed, which differs from the tag you're promoting. This is expected if Development has since moved on to someone else's build - double check you meant to promote your own tested build."
+          fi
+
+  deploy-qa:
+    name: Deploy to QA
+    needs: verify-build
+    uses: ./.github/workflows/deploy-template-frontend.yml
+    with:
+      environment: qa
+      build_tag: ${{ inputs.build_tag }}
+    secrets: inherit
