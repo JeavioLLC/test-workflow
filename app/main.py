@@ -17,7 +17,7 @@ def create_app() -> Flask:
 
     @app.get("/")
     def index() -> Response:
-        return jsonify(message="Hii from the sample CI/CD application")
+        return jsonify(message="Hello from the sample CI/CD application")
 
     @app.get("/items")
     def list_items() -> Response:

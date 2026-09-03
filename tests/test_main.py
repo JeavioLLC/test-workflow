@@ -25,7 +25,7 @@ def test_index_returns_welcome_message(client: FlaskClient) -> None:
     response = client.get("/")
 
     assert response.status_code == 200
-    assert response.get_json() == {"message": "Hii from the sample CI/CD application"}
+    assert response.get_json() == {"message": "Hello from the sample CI/CD application"}
 
 
 def test_list_items_returns_empty_list_initially(client: FlaskClient) -> None:
