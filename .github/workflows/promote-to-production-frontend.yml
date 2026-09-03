@@ -1,0 +1,87 @@
+name: Promote - Deploy Frontend to Production
+
+# Frontend counterpart of promote-to-production.yml. Manual promotion
+# step, run from the Actions tab ("Run workflow"). Triggering this IS
+# the release approval, once Staging/UAT sign-off is done.
+#
+# build_tag is REQUIRED and must name the exact version you validated in
+# Staging - it is never inferred from "whatever is currently deployed to
+# Staging". Use the version from your release/v<version> branch name,
+# e.g. 1.0.0. No rebuild happens - the exact build you name is deployed
+# unchanged.
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tag:
+        description: "Exact version you validated in Staging, e.g. 1.0.0 (NOT left blank / NOT assumed)"
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  verify-build:
+    name: Verify Build to Promote
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Verify build exists in artifacts bucket
+        run: |
+          if ! aws s3 ls "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${{ inputs.build_tag }}/" > /dev/null; then
+            echo "::error::No build found at tag '${{ inputs.build_tag }}'. Check the version from your cd-release-frontend.yml run."
+            exit 1
+          fi
+          echo "Promoting build ${{ inputs.build_tag }}"
+
+      - name: Sanity check against current Staging deployment
+        run: |
+          CURRENT=$(aws ssm get-parameter \
+            --name "/${{ vars.APP_NAME }}/staging/frontend/current-build" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "unknown")
+          if [ "${CURRENT}" != "${{ inputs.build_tag }}" ]; then
+            echo "::notice::Staging currently has build '${CURRENT}' deployed, which differs from the version you're promoting. This is expected if Staging has since moved on to a newer release branch - double check you meant to promote this version."
+          fi
+
+  deploy-production:
+    name: Deploy to Production
+    needs: verify-build
+    uses: ./.github/workflows/deploy-template-frontend.yml
+    with:
+      environment: production
+      build_tag: ${{ inputs.build_tag }}
+    secrets: inherit
+
+  rollback:
+    name: Automated Rollback
+    needs: deploy-production
+    if: ${{ failure() }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Roll back to previous build
+        run: |
+          PREVIOUS="${{ needs.deploy-production.outputs.previous_build_tag }}"
+          if [ -z "${PREVIOUS}" ] || [ "${PREVIOUS}" == "none" ]; then
+            echo "::error::No previous build tag was captured - cannot roll back automatically."
+            exit 1
+          fi
+          aws s3 sync "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${PREVIOUS}/" \
+            "s3://${{ vars.FRONTEND_S3_BUCKET }}/" \
+            --delete
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"

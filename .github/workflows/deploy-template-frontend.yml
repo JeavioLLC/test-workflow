@@ -1,0 +1,82 @@
+name: Deploy Template Frontend (S3 + CloudFront)
+
+# Reusable deploy step shared by every stage of every frontend pipeline
+# (cd-develop-frontend.yml, promote-to-qa-frontend.yml,
+# cd-release-frontend.yml, promote-to-production-frontend.yml), mirroring
+# deploy-template.yml's role for the backend - same immutable build is
+# promoted to each environment unchanged (Build Once, Deploy Anywhere).
+#
+# Unlike the backend, there's no ECR/image concept here: each build job
+# uploads its static `npm run build` output once to
+# s3://<FRONTEND_ARTIFACTS_BUCKET>/<APP_NAME>-frontend/<build_tag>/ (the
+# frontend equivalent of an ECR image tag), and this template syncs that
+# exact, already-built artifact into the target environment's website
+# bucket and invalidates CloudFront - it never rebuilds.
+#
+# Each environment must define, as Environment variables/secrets:
+#   vars.AWS_REGION, vars.FRONTEND_S3_BUCKET, vars.CLOUDFRONT_DISTRIBUTION_ID, vars.APP_NAME
+#   secrets.FRONTEND_AWS_ROLE_ARN (OIDC role with s3:*/cloudfront:CreateInvalidation/ssm:PutParameter on that env's resources)
+#
+# Rollback: `previous_build_tag` is exposed as an output so the rollback
+# job in promote-to-production-frontend.yml can force-resync it if the
+# deploy job itself fails. There's no equivalent to ECS's deployment
+# circuit breaker for static S3 hosting - a bad deploy stays live until
+# rolled back or replaced.
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target GitHub Environment name (development/qa/staging/production)"
+        required: true
+        type: string
+      build_tag:
+        description: "Immutable build tag to deploy, e.g. dev-a1b2c3d or 1.0.0 (already uploaded to the artifacts bucket)"
+        required: true
+        type: string
+    outputs:
+      previous_build_tag:
+        description: "Build tag that was live before this deploy (used for rollback)"
+        value: ${{ jobs.deploy.outputs.previous_build_tag }}
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      previous_build_tag: ${{ steps.capture-previous.outputs.build_tag }}
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.FRONTEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Capture currently deployed build tag (for rollback)
+        id: capture-previous
+        run: |
+          TAG=$(aws ssm get-parameter \
+            --name "/${{ vars.APP_NAME }}/${{ inputs.environment }}/frontend/current-build" \
+            --query 'Parameter.Value' --output text 2>/dev/null || echo "none")
+          echo "build_tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Sync build to environment bucket
+        run: |
+          aws s3 sync "s3://${{ vars.FRONTEND_ARTIFACTS_BUCKET }}/${{ vars.APP_NAME }}-frontend/${{ inputs.build_tag }}/" \
+            "s3://${{ vars.FRONTEND_S3_BUCKET }}/" \
+            --delete
+
+      - name: Invalidate CloudFront cache
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id "${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}" \
+            --paths "/*"
+
+      - name: Record deployed version (traceability)
+        run: |
+          aws ssm put-parameter \
+            --name "/${{ vars.APP_NAME }}/${{ inputs.environment }}/frontend/current-build" \
+            --value "${{ inputs.build_tag }}" \
+            --type String \
+            --overwrite
