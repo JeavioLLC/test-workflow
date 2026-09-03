@@ -1,5 +1,0 @@
-# Tooling used by the CI pipeline (linting, testing, coverage).
-# Application dependencies belong in requirements.txt - this file is CI-only.
-ruff==0.6.9
-pytest==8.3.3
-pytest-cov==5.0.0
