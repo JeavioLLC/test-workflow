@@ -1,8 +1,11 @@
-name: CI - PR Validation
+name: CI - PR Validation (Frontend)
 
-# Section 2 / Table 2 of the CI/CD Framework: every Pull Request into develop
-# or main must pass these quality & security gates before it can be merged.
-# The pipeline fails immediately if any mandatory job fails.
+# Frontend counterpart of ci-pr-validation.yml (Section 2 / Table 2 of the
+# CI/CD Framework): every Pull Request into develop or main that touches
+# frontend/ must pass these quality & security gates before it can be
+# merged. Same gate structure as the backend workflow - lint, unit tests
+# + coverage, and the shared jeavio-governance secret/SAST/dependency/
+# license scans - just pointed at the React app instead of the Python one.
 
 on:
   pull_request:
@@ -11,14 +14,14 @@ on:
       - main
       - "release/**"
     paths:
-      - "backend/**"
-      - ".github/workflows/ci-pr-validation.yml"
+      - "frontend/**"
+      - ".github/workflows/ci-pr-validation-frontend.yml"
 
 permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: ${{ vars.PYTHON_VERSION || '3.12' }}
+  NODE_VERSION: ${{ vars.NODE_VERSION || '20' }}
 
 jobs:
   # ---------------------------------------------------------------------
@@ -29,28 +32,38 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
+          fetch-depth: 0
 
-      - name: Install lint tooling
-        working-directory: backend
-        run: pip install -r requirements-ci.txt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
 
-      - name: Run ruff
-        working-directory: backend
-        run: ruff check .
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
 
-      - name: Run ruff (format check)
-        working-directory: backend
-        run: ruff format --check .
+      - name: Determine changed frontend files
+        id: changed-files
+        run: |
+          git diff --name-only --diff-filter=ACMR \
+            "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" \
+            -- 'frontend/**/*.js' 'frontend/**/*.jsx' \
+            | sed 's#^frontend/##' > changed_files.txt
+          echo "Changed frontend files:"
+          cat changed_files.txt
+          echo "count=$(wc -l < changed_files.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Run eslint
+        if: steps.changed-files.outputs.count != '0'
+        working-directory: frontend
+        run: xargs -a ../changed_files.txt npx eslint
 
   # ---------------------------------------------------------------------
   # Unit Tests & Code Coverage (threshold set by the COVERAGE_THRESHOLD
-  # repo/org variable - Settings -> Secrets and variables -> Actions ->
-  # Variables. Defaults to 80 if that variable isn't set.
+  # repo/org variable, same one the backend job uses - defaults to 80).
   # ---------------------------------------------------------------------
   test:
     name: Unit Tests & Code Coverage
@@ -60,44 +73,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: "pip"
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Install dependencies
-        working-directory: backend
-        run: |
-          pip install -r requirements-ci.txt
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+        working-directory: frontend
+        run: npm ci
 
       - name: Run unit tests with coverage
-        working-directory: backend
+        working-directory: frontend
         run: |
           echo "Enforcing minimum coverage: ${COVERAGE_THRESHOLD}%"
-          pytest \
-            --cov=. \
-            --cov-report=xml \
-            --cov-report=html \
-            --cov-report=term-missing \
-            --cov-fail-under="${COVERAGE_THRESHOLD}"
+          npx vitest run --coverage \
+            --coverage.thresholds.lines="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.functions="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.branches="${COVERAGE_THRESHOLD}" \
+            --coverage.thresholds.statements="${COVERAGE_THRESHOLD}"
 
       - name: Upload coverage report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-report
-          path: |
-            backend/coverage.xml
-            backend/htmlcov/
+          name: coverage-report-frontend
+          path: frontend/coverage/
           retention-days: 14
 
   # ---------------------------------------------------------------------
-  # Prepare Jeavio Governance Tool
-  # Fetches jeavio-governance.sh from AWS CodeArtifact ONCE and shares it
-  # with every scan job below as a build artifact (Build Once, reuse
-  # everywhere - same philosophy as the deploy pipeline) instead of every
-  # scan job re-authenticating to CodeArtifact independently.
+  # Prepare Jeavio Governance Tool (same shared tool as the backend
+  # workflow - fetched independently here since GitHub Actions artifacts
+  # don't cross workflow files, even within the same PR).
   # ---------------------------------------------------------------------
   prepare-governance-tool:
     name: Prepare Jeavio Governance Tool
@@ -123,14 +130,13 @@ jobs:
       - name: Upload governance tool artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jeavio-governance-tool
+          name: jeavio-governance-tool-frontend
           path: jeavio-governance
           retention-days: 1
 
   # ---------------------------------------------------------------------
   # Secret Detection - jeavio-governance --scan (TEST_TYPE=detect-secrets)
   # ---------------------------------------------------------------------
-  
   secret-detection:
     name: Secret Detection
     runs-on: ubuntu-latest
@@ -144,7 +150,7 @@ jobs:
       - name: Download jeavio-governance tool
         uses: actions/download-artifact@v4
         with:
-          name: jeavio-governance-tool
+          name: jeavio-governance-tool-frontend
           path: ${{ runner.temp }}/governance-tool
 
       - name: Configure AWS credentials (OIDC)
@@ -162,11 +168,11 @@ jobs:
       - name: Generate config.env
         run: |
           cat > ~/jeavio-governance/config/config.env <<EOF
-          PROJECT_NAME=${{ github.event.repository.name }}
-          PROJECT_DIRECTORY=${{ github.workspace }}/backend
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
           TECH_DOMAIN=web
-          TECH_STACK=python
-          TECH_STACK_VERSION=${{ env.PYTHON_VERSION }}
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
           TEST_TYPE=detect-secrets
           NUMBER_OF_LOG_FILES_TO_KEEP=3
           EOF
@@ -178,7 +184,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: secret-detection-reports
+          name: secret-detection-reports-frontend
           path: ${{ env.HOME }}/jeavio-governance/sast-reports
           retention-days: 14
 
@@ -199,7 +205,7 @@ jobs:
       - name: Download jeavio-governance tool
         uses: actions/download-artifact@v4
         with:
-          name: jeavio-governance-tool
+          name: jeavio-governance-tool-frontend
           path: ${{ runner.temp }}/governance-tool
 
       - name: Configure AWS credentials (OIDC)
@@ -217,11 +223,11 @@ jobs:
       - name: Generate config.env
         run: |
           cat > ~/jeavio-governance/config/config.env <<EOF
-          PROJECT_NAME=${{ github.event.repository.name }}
-          PROJECT_DIRECTORY=${{ github.workspace }}/backend
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
           TECH_DOMAIN=web
-          TECH_STACK=python
-          TECH_STACK_VERSION=${{ env.PYTHON_VERSION }}
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
           TEST_TYPE=source-code-sast
           NUMBER_OF_LOG_FILES_TO_KEEP=3
           EOF
@@ -233,7 +239,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sast-scan-reports
+          name: sast-scan-reports-frontend
           path: ${{ env.HOME }}/jeavio-governance/sast-reports
           retention-days: 14
 
@@ -254,7 +260,7 @@ jobs:
       - name: Download jeavio-governance tool
         uses: actions/download-artifact@v4
         with:
-          name: jeavio-governance-tool
+          name: jeavio-governance-tool-frontend
           path: ${{ runner.temp }}/governance-tool
 
       - name: Configure AWS credentials (OIDC)
@@ -272,11 +278,11 @@ jobs:
       - name: Generate config.env
         run: |
           cat > ~/jeavio-governance/config/config.env <<EOF
-          PROJECT_NAME=${{ github.event.repository.name }}
-          PROJECT_DIRECTORY=${{ github.workspace }}/backend
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
           TECH_DOMAIN=web
-          TECH_STACK=python
-          TECH_STACK_VERSION=${{ env.PYTHON_VERSION }}
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
           TEST_TYPE=dependency-vuln
           NUMBER_OF_LOG_FILES_TO_KEEP=3
           EOF
@@ -288,13 +294,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dependency-scan-reports
+          name: dependency-scan-reports-frontend
           path: ${{ env.HOME }}/jeavio-governance/sast-reports
           retention-days: 14
 
   # ---------------------------------------------------------------------
   # License Compliance Scan
   # jeavio-governance --scan (TEST_TYPE=dependency-license)
+  # Note: PACKAGE_MANAGER_VERSION is only required by the tool when
+  # TECH_STACK=python - not needed here for javascript.
   # ---------------------------------------------------------------------
   license-scan:
     name: License Compliance Scan
@@ -309,7 +317,7 @@ jobs:
       - name: Download jeavio-governance tool
         uses: actions/download-artifact@v4
         with:
-          name: jeavio-governance-tool
+          name: jeavio-governance-tool-frontend
           path: ${{ runner.temp }}/governance-tool
 
       - name: Configure AWS credentials (OIDC)
@@ -327,12 +335,11 @@ jobs:
       - name: Generate config.env
         run: |
           cat > ~/jeavio-governance/config/config.env <<EOF
-          PROJECT_NAME=${{ github.event.repository.name }}
-          PROJECT_DIRECTORY=${{ github.workspace }}/backend
+          PROJECT_NAME=${{ github.event.repository.name }}-frontend
+          PROJECT_DIRECTORY=${{ github.workspace }}/frontend
           TECH_DOMAIN=web
-          TECH_STACK=python
-          TECH_STACK_VERSION=${{ env.PYTHON_VERSION }}
-          PACKAGE_MANAGER_VERSION=${{ vars.PIP_VERSION || '24.0' }}
+          TECH_STACK=javascript
+          TECH_STACK_VERSION=${{ env.NODE_VERSION }}
           TEST_TYPE=dependency-license
           NUMBER_OF_LOG_FILES_TO_KEEP=3
           EOF
@@ -344,7 +351,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: license-scan-reports
+          name: license-scan-reports-frontend
           path: ${{ env.HOME }}/jeavio-governance/sast-reports
           retention-days: 14
 
