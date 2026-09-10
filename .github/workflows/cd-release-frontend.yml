@@ -6,13 +6,19 @@ name: CD - Release Frontend (Build & Deploy Staging)
 # name, and deploys it straight to Staging for UAT. The pipeline stops
 # here - promotion to Production is a separate, manually-triggered
 # workflow (promote-to-production-frontend.yml).
+#
+# No `paths` filter here (unlike cd-develop-frontend.yml): a release
+# branch is cut once as a full-stack snapshot for staging/UAT, always
+# building both frontend and backend together regardless of which
+# changed. Path filters also wouldn't work for the branch-creation push
+# anyway - GitHub can't compute a diff when a branch is created pointing
+# at an existing commit with no new commits of its own, so a
+# paths-filtered push trigger never fires on that initial push.
 
 on:
   push:
     branches:
       - "release/v*"
-    paths:
-      - "frontend/**"
 
 permissions:
   id-token: write

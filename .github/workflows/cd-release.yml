@@ -8,13 +8,19 @@ name: CD - Release (Build & Deploy Staging)
 # (promote-to-production.yml) run from the Actions tab, since this
 # repo's GitHub plan doesn't support native Environment "Required
 # reviewers".
+#
+# No `paths` filter here (unlike cd-develop.yml): a release branch is cut
+# once as a full-stack snapshot for staging/UAT, always building both
+# frontend and backend together regardless of which changed. Path filters
+# also wouldn't work for the branch-creation push anyway - GitHub can't
+# compute a diff when a branch is created pointing at an existing commit
+# with no new commits of its own, so a paths-filtered push trigger never
+# fires on that initial push.
 
 on:
   push:
     branches:
       - "release/v*"
-    paths:
-      - "backend/**"
 
 permissions:
   id-token: write
