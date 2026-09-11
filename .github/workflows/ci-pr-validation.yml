@@ -46,7 +46,6 @@ jobs:
       - name: Run ruff (format check)
         working-directory: backend
         run: ruff format --check .
-
   # ----------------------------------------------------------------------
   # Unit Tests & Code Coverage (threshold set by the COVERAGE_THRESHOLD
   # repo/org variable - Settings -> Secrets and variables -> Actions ->
