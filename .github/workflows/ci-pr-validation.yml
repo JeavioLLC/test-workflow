@@ -47,11 +47,11 @@ jobs:
         working-directory: backend
         run: ruff format --check .
 
-  # ---------------------------------------------------------------------
+  # ----------------------------------------------------------------------
   # Unit Tests & Code Coverage (threshold set by the COVERAGE_THRESHOLD
   # repo/org variable - Settings -> Secrets and variables -> Actions ->
   # Variables. Defaults to 80 if that variable isn't set.
-  # ---------------------------------------------------------------------
+  # ----------------------------------------------------------------------
   test:
     name: Unit Tests & Code Coverage
     runs-on: ubuntu-latest

@@ -1,132 +1,279 @@
 # CI/CD Pipeline
 
-Implements the CI/CD & Software Delivery Framework (`CI_CD Framework.docx`) for this monorepo: a Python backend deployed to **Amazon ECS Fargate** (image storage in **Amazon ECR**), and a React frontend (`frontend/`) deployed as a static build to **Amazon S3 + CloudFront**. The two pipelines are fully independent — separate workflow files, separate triggers (path-filtered to `frontend/**` vs the rest of the repo), separate AWS resources — but follow the same shape: PR gates, build once, deploy to Development automatically, promote to QA/Staging/Production by hand.
+Implements the CI/CD & Software Delivery Framework (`CI_CD Framework.docx`) for this monorepo: a Python backend (`backend/`) deployed to **Amazon ECS Fargate** (images in **Amazon ECR**), and a React frontend (`frontend/`) deployed as a static build to **Amazon S3 + CloudFront**. The two pipelines are fully independent — separate workflow files, separate triggers (path-filtered to `backend/**` / `frontend/**`), separate AWS resources — but follow the same shape and the same branching model.
 
-## Backend Pipeline (Python + ECS Fargate)
+These workflows are written to be **reused across projects**: copy `.github/workflows/` into a new repo, point `APP_NAME`/`ECR_REPOSITORY`/bucket names at that project's own resources, and follow the setup guide below. Nothing in the YAML is project-specific beyond the config values described here.
 
-| Workflow                     | Trigger                                        | Purpose                                                                                   |
-| ----------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `ci-pr-validation.yml`        | Pull request → `develop`, `main`, `release/**`  | Lint, unit tests + 80% coverage, secret/SAST/dependency/license gates (via jeavio-governance) |
-| `cd-develop.yml`              | Push to `develop`                               | Build one image, deploy to Development. Stops here.                                       |
-| `promote-to-qa.yml`           | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact image tag you name to QA, unchanged.                   |
-| `cd-release.yml`              | Push to `release/v*`                            | Version taken from branch name, build one image, deploy to Staging. Stops here.           |
-| `promote-to-production.yml`   | Manual (Actions tab → Run workflow, requires `image_tag`) | Deploy the exact version you name to Production, unchanged. Automated rollback on failure. |
-| `deploy-template.yml`         | Called by every workflow above                 | Shared ECS Fargate deploy step, reused unchanged per environment                          |
-
-### Flow
+## Branching strategy
 
 ```
 feature/*  --PR-->  develop
                        │  (push)
                        ▼
-       cd-develop.yml: build image dev-<sha>  ->  Deploy Dev   [stops]
+       cd-develop*.yml: build once, tag dev-<sha>  ->  Deploy to Development   [stops]
 
-                       │  someone runs promote-to-qa.yml by hand,
-                       │  naming the exact dev-<sha> tag they tested
+                       │  someone runs promote-to-qa*.yml by hand,
+                       │  naming the exact tag they tested
                        ▼        (this manual trigger IS the approval)
-                  Deploy QA
+                  Deploy to QA
 
 
 develop  --(cut by hand)-->  release/v1.0.0
                        │  (push)
                        ▼
-   cd-release.yml: version = "1.0.0" from branch name
+   cd-release*.yml: version = "1.0.0" taken from the branch name
                        │
                        ▼
-       build image:1.0.0  ->  Deploy Staging   [stops]
+       build once, tag 1.0.0  ->  Deploy to Staging   [stops]
 
-                       │  someone runs promote-to-production.yml by hand,
+                       │  someone runs promote-to-production*.yml by hand,
                        │  naming the exact version they validated
                        ▼        (this manual trigger IS the approval)
-              Deploy Production  ->  Rollback (on failure)
+              Deploy to Production  ->  Automated rollback (on failure)
 ```
 
-No image is ever rebuilt between stages (Build Once, Deploy Anywhere): `cd-develop.yml` builds once for Development, and `promote-to-qa.yml` redeploys that exact image to QA; `cd-release.yml` builds once (tagged with the version from the release branch name) for Staging, and `promote-to-production.yml` redeploys that exact image to Production.
+- **PRs** into `develop`, `main`, or `release/**` must pass `ci-pr-validation.yml` / `ci-pr-validation-frontend.yml` (see "Checks & where to find reports" below).
+- **`develop`** auto-deploys to Development on every push. It's a shared environment — a later merge can redeploy over whoever's still testing, so QA/Production promotion always requires you to name the *exact* tag/version you tested, never "whatever's currently deployed."
+- **`release/vX.Y.Z`** branches are cut by hand from `develop` and auto-deploy to Staging. The version in the branch name becomes the image tag / build tag for that release — no rebuild happens after this point.
+- **Promotion to QA and Production is manual** (Actions tab → Run workflow), because private repos on this GitHub plan don't get native Environment "Required reviewers." The manual trigger *is* the approval; who can click it is controlled by normal repo **Write** access (Settings → Collaborators and teams).
+- No image/bundle is ever rebuilt between stages (Build Once, Deploy Anywhere) — promotion always redeploys the exact artifact that was built earlier.
 
-### Development/Staging are shared environments — name your tag explicitly
-
-Development and Staging are each a single ECS service reused by everyone. If two developers merge to `develop` close together, the second merge's `cd-develop.yml` run redeploys Development on top of whoever is still testing the first. Because of this, `promote-to-qa.yml` / `promote-to-production.yml` **require** an explicit `image_tag` input — they never assume "whatever is currently deployed upstream" is the thing you tested, since that could by then be someone else's untested build. Find your tag from your own `cd-develop.yml` (or `cd-release.yml`) run's "Build & Push Image" step summary before promoting.
-
-`cd-develop.yml` also sets `concurrency: group: deploy-development` so two deploys can't race the same ECS service at once — this only prevents a corrupted/flapping deployment, it does not stop a later merge from legitimately overwriting Development while your testing is still in progress. If concurrent feature testing on a shared Dev environment becomes a recurring problem, the real fix is isolated per-developer/per-branch environments — ask if you want that built out.
-
-### Manual approval gates (no native Environment reviewers on this plan)
-
-Environment "Required reviewers" needs a public repo or a GitHub Team/Enterprise Cloud plan for private repos — this repo is private on Free/Pro, where Environments only expose Deployment branches/tags + secrets/variables, not protection rules.
-
-So promotion is a **separate, manually-triggered workflow** instead of a pause mid-pipeline:
-
-- `promote-to-qa.yml` and `promote-to-production.yml` only run when someone goes to the **Actions tab → select the workflow → Run workflow**. That click is the approval — there's nothing to configure for it.
-- Who can click it is controlled by normal repo permissions: only collaborators with **Write** access (or higher) can trigger a `workflow_dispatch`. Manage this under Settings → Collaborators and teams.
-- `image_tag` is a required input — see "Development/Staging are shared environments" below for why it's never defaulted.
-
-## Frontend Pipeline (React + S3/CloudFront)
-
-| Workflow                              | Trigger                                        | Purpose                                                                                   |
-| --------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------ |
-| `ci-pr-validation-frontend.yml`       | Pull request → `develop`, `main`, `release/**`, paths `frontend/**` | Lint, unit tests + coverage, secret/SAST/dependency/license gates (via jeavio-governance) |
-| `cd-develop-frontend.yml`             | Push to `develop`, paths `frontend/**`         | Build one static bundle, deploy to Development. Stops here.                               |
-| `promote-to-qa-frontend.yml`          | Manual (Actions tab → Run workflow, requires `build_tag`) | Deploy the exact build tag you name to QA, unchanged.                        |
-| `cd-release-frontend.yml`             | Push to `release/v*`, paths `frontend/**`      | Version taken from branch name, build one bundle, deploy to Staging. Stops here.          |
-| `promote-to-production-frontend.yml`  | Manual (Actions tab → Run workflow, requires `build_tag`) | Deploy the exact version you name to Production, unchanged. Automated rollback on failure. |
-| `deploy-template-frontend.yml`        | Called by every workflow above                 | Shared S3 sync + CloudFront invalidation step, reused unchanged per environment           |
-
-Same shape as the backend pipeline (build once, deploy to Development automatically, promote to QA/Staging/Production by hand — see "Manual approval gates" above, which applies equally here), just swapping the artifact: instead of an immutable ECR image tag, each build job runs `npm run build` once and uploads the static output to `s3://<FRONTEND_ARTIFACTS_BUCKET>/<APP_NAME>-frontend/<build_tag>/` — the frontend's equivalent of pushing an image to ECR. `deploy-template-frontend.yml` then syncs that exact, already-built artifact into the target environment's bucket and invalidates CloudFront; it never rebuilds. `promote-to-qa-frontend.yml` / `promote-to-production-frontend.yml` require an explicit `build_tag` input for the same reason `image_tag` is required on the backend side — Development/Staging are shared, so "whatever's currently deployed" may not be what you tested.
-
-There's no equivalent of ECS's Deployment Circuit Breaker for static S3 hosting — a bad deploy stays live until rolled back or replaced. `promote-to-production-frontend.yml`'s `rollback` job covers this the same way the backend's does: if `deploy-production` fails, it force-resyncs the `previous_build_tag` captured by `deploy-template-frontend.yml` and re-invalidates CloudFront.
-
-## Required one-time repo/AWS setup
-
-### Backend
-
-1. **ECR repository**: create one repository (e.g. `my-app`) that holds every tag — `dev-<sha>` from develop builds and `<major>.<minor>.<patch>` from release builds.
-2. **ECS Fargate**: a cluster, service and task definition must already exist per environment (development/qa/staging/production) before the first deploy — the pipeline updates the image on an existing task definition/service, it does not provision infrastructure.
-3. **GitHub Environments** (Settings → Environments): create `development`, `qa`, `staging`, `production`. On each, set:
-   - Variables: `AWS_REGION`, `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION_FAMILY`, `CONTAINER_NAME`, `APP_URL` (the base URL of that environment, e.g. an ALB DNS name)
-   - Secret: `AWS_ROLE_ARN` — an IAM role (OIDC, via `aws-actions/configure-aws-credentials`) scoped to that environment's ECS/SSM resources
-4. **Repository-level** (not environment-scoped) config, used by the build steps and by the promote workflows' image-resolution step:
-   - Variables: `AWS_REGION`, `ECR_REPOSITORY`, `APP_NAME`
-   - Secret: `AWS_ROLE_ARN` (a role with ECR push + `ssm:GetParameter` permissions)
-
-### Frontend
-
-1. **S3 artifacts bucket**: one bucket (repo-level, e.g. `my-app-frontend-artifacts`) that holds every immutable build under `<APP_NAME>-frontend/<build_tag>/` — `dev-<sha>` from develop builds and `<major>.<minor>.<patch>` from release builds. Not the same bucket the website is served from.
-2. **S3 website bucket + CloudFront distribution**: must already exist per environment (development/qa/staging/production) before the first deploy — the pipeline syncs the build into an existing bucket and invalidates an existing distribution, it does not provision infrastructure.
-3. **GitHub Environments**, same four as the backend. On each, set:
-   - Variables: `AWS_REGION`, `FRONTEND_S3_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID`, `APP_NAME`
-   - Secret: `FRONTEND_AWS_ROLE_ARN` — an IAM role (OIDC) scoped to that environment's S3/CloudFront/SSM resources. Deliberately a separate secret from the backend's `AWS_ROLE_ARN` so the two pipelines' IAM roles stay independently scoped (least privilege — the S3/CloudFront role has no reason to touch ECS, and vice versa).
-4. **Repository-level** config:
-   - Variables: `AWS_REGION`, `FRONTEND_ARTIFACTS_BUCKET`, `APP_NAME`, `NODE_VERSION` (optional, defaults to `20`)
-   - Secret: `FRONTEND_AWS_ROLE_ARN` (a role with `s3:PutObject` on the artifacts bucket + `ssm:GetParameter`)
-
-### Shared
-
-5. **Branch protection**, matching the framework's branching strategy: require the `CI - PR Validation` status checks (and, once you're ready to make it a hard gate, `CI - PR Validation (Frontend)`) on `main`, `develop`, and `release/**` before merge. Note: `ci-pr-validation-frontend.yml` is path-filtered to `frontend/**`, so a PR that never touches `frontend/` won't trigger it — don't mark it as a *required* status check until you've confirmed that's the behavior you want (a required check that never runs blocks merging indefinitely).
-6. **Optional**: set the repo/org variable `COVERAGE_THRESHOLD` (e.g. `85`) to change the minimum unit test coverage enforced by both `ci-pr-validation.yml`'s `test` job and `ci-pr-validation-frontend.yml`'s `test` job — defaults to `80` if unset.
-7. **Jeavio Governance tool** (secret-detection/sast-scan/dependency-scan/license-scan jobs, used by both pipelines), repo-level, separate from either deploy pipeline's AWS account/role above:
-   - Secret: `GOVERNANCE_AWS_ROLE_ARN` — an OIDC role in the Jeavio governance AWS account with read access to the `jeavio-governance` CodeArtifact package, the `governance/*` ECR repositories, and the `governance-dependency-check-volume` S3 bucket.
-   - Variable (optional): `GOVERNANCE_AWS_REGION` — defaults to `ap-south-1` if unset.
-   - Variable (optional): `PIP_VERSION` — pip version reported in the backend's license scan; defaults to `24.0` if unset. Not used by the frontend's license scan (only required by the tool for `TECH_STACK=python`).
-
-## Rollback
+## Workflows at a glance
 
 **Backend:**
 
-1. **ECS Deployment Circuit Breaker** — `deploy-template.yml` enables this on the service before every deploy (`deploymentCircuitBreaker: {enable: true, rollback: true}`). If the new tasks never reach a healthy steady state (crash-looping, failing ELB/container health checks), ECS itself detects this and automatically reverts the service to the previous task definition — no scripting involved, happens within the deploy. Because `aws ecs wait services-stable` reports success even in this case (the service genuinely is stable, just on the old revision), a follow-up "Verify deployment did not auto-rollback" step compares the post-deploy task definition against the one captured before the deploy and fails the job loudly if ECS silently reverted it.
-2. **Automated rollback job** (`promote-to-production.yml`'s `rollback`) — if the `deploy-production` job fails for any reason, this job force-redeploys the `previous_task_definition` captured by `deploy-template.yml`.
+| Workflow | Trigger | Purpose |
+| --- | --- | --- |
+| `ci-pr-validation.yml` | PR → `develop`, `main`, `release/**` | Quality & security gates |
+| `cd-develop.yml` | Push to `develop` | Build once, deploy to Development |
+| `promote-to-qa.yml` | Manual, requires `image_tag` | Deploy that exact image to QA |
+| `cd-release.yml` | Push to `release/v*` | Build once (version from branch name), deploy to Staging |
+| `promote-to-production.yml` | Manual, requires `image_tag` | Deploy that exact image to Production, with automated rollback |
+| `deploy-template.yml` | Called by the workflows above | Shared ECS deploy step, reused per environment |
 
-**Frontend:** no circuit-breaker equivalent exists for static S3 hosting. **Automated rollback job** (`promote-to-production-frontend.yml`'s `rollback`) — if `deploy-production` fails for any reason, this job force-resyncs the `previous_build_tag` captured by `deploy-template-frontend.yml` and re-invalidates CloudFront.
+**Frontend** (same shape, `frontend-` suffixed workflow files, inputs named `build_tag` instead of `image_tag`) — `ci-pr-validation-frontend.yml`, `cd-develop-frontend.yml`, `promote-to-qa-frontend.yml`, `cd-release-frontend.yml`, `promote-to-production-frontend.yml`, `deploy-template-frontend.yml`.
 
-## Traceability: "current version per environment"
+## AWS setup
 
-Every backend deploy (`deploy-template.yml`) writes the deployed image URI to SSM Parameter Store at `/${APP_NAME}/${environment}/current-image`; every frontend deploy (`deploy-template-frontend.yml`) writes the deployed build tag to `/${APP_NAME}/${environment}/frontend/current-build`. Both are an audit trail of what's running where, queryable independent of which pipeline run deployed it. The promote workflows also read the relevant one to print a non-blocking `::notice::` if the tag you named differs from what's currently live upstream (expected when Development/Staging has since moved on to someone else's build — just a prompt to double-check you meant to promote your own).
+Each environment (**development**, **qa**, **staging**, **production**) needs its own AWS resources and its own IAM role — never share a role across environments, since that defeats the point of scoping blast radius per environment.
 
-## Security/quality gates: the Jeavio Governance tool
+### Resources that must already exist per environment
 
-`secret-detection`, `sast-scan`, `dependency-scan`, and `license-scan` (present in both `ci-pr-validation.yml` and `ci-pr-validation-frontend.yml`) all run the same tool (`sast-automation/jeavio-governance.sh` in this repo) against different `TEST_TYPE`s (`detect-secrets`, `source-code-sast`, `dependency-vuln`, `dependency-license` respectively), using the `--ci` flag added for pipeline use (see `sast-automation/jeavio-governance.sh` — it's fully backward compatible with local/manual runs that omit `--ci`). The frontend jobs point `PROJECT_DIRECTORY` at `frontend/` and set `TECH_STACK=javascript` instead of `python`; everything else about how the tool runs is identical.
+The pipeline deploys to existing infrastructure; it does not provision any of this.
 
-- A `prepare-governance-tool` job fetches the script from AWS CodeArtifact **once per workflow** (OIDC via `GOVERNANCE_AWS_ROLE_ARN`) and uploads it as a GitHub Actions artifact (`jeavio-governance-tool` for the backend, `jeavio-governance-tool-frontend` for the frontend — artifacts don't cross workflow files, so each pipeline fetches its own copy); every scan job in that workflow downloads it instead of each re-authenticating to CodeArtifact independently.
-- Each scan job then authenticates to AWS itself (OIDC, same role) — `--scan --ci` still needs to pull the actual `governance/*` scanner images from ECR and sync vulnerability data from S3, which the shared artifact download doesn't cover.
-- `--ci` mode makes `jeavio-governance` exit non-zero if any sub-scan fails or reports a violation, which is what makes these jobs actually gate the PR (by default the tool only logs failures, it doesn't fail the run — see `--ci`'s `CI_EXIT_STATUS`/`SCAN_RESULTS` tracking in the script).
-- Reports land in `~/jeavio-governance/sast-reports` on the runner and are uploaded (`if: always()`) as the `secret-detection-reports` / `sast-scan-reports` / `dependency-scan-reports` / `license-scan-reports` artifacts (suffixed `-frontend` for the frontend workflow; 14-day retention) for anyone to review from that workflow run's Summary page.
-- **Caveat**: every scan is a full-tree scan of whatever `actions/checkout` pulled down (the whole PR branch, or `frontend/` for the frontend jobs) — there's no diff-only/incremental mode in this tool (confirmed: no `git diff`, no SonarQube PR-decoration params anywhere in `sast-automation/`). A PR can fail this gate on a pre-existing issue it didn't introduce, not just on newly introduced ones.
-- **Caveat**: `secret-detection-reports` can contain the actual secret values `detect-secrets` found — anyone with repo/Actions read access can download that artifact. Tighten retention or restrict repo visibility if that's a concern.
+| Environment resource | Backend | Frontend |
+| --- | --- | --- |
+| Compute/hosting | ECS cluster + service + an initial task definition revision | S3 bucket (private, CloudFront-only via OAC) + CloudFront distribution |
+| Shared, repo-level | One ECR repository holding every tag | One S3 "artifacts" bucket holding every immutable build |
+
+**Gotcha to watch for**: if your ECS task definition's `logConfiguration` uses `awslogs-create-group: true`, deploys will fail with `AccessDenied` on `logs:CreateLogGroup` unless `ecsTaskExecutionRole` is explicitly granted that permission. Simplest fix: pre-create the CloudWatch log group yourself and drop the `awslogs-create-group` flag.
+
+### IAM roles (GitHub OIDC)
+
+Each project needs **one repo-level role per pipeline, plus one role per environment per pipeline** — 2 roles at repo level (backend + frontend) and 2 roles × 4 environments = 8 environment-scoped roles, all federated via `token.actions.githubusercontent.com`.
+
+| Role | Scope | Permissions needed |
+| --- | --- | --- |
+| Backend, repo-level | Any ref/environment in this repo | `ecr:GetAuthorizationToken`, push permissions on the one ECR repo, `ssm:GetParameter` on `/{APP_NAME}/*/current-image` |
+| Backend, per environment | `environment:<name>` only | `ecs:DescribeServices`, `ecs:DescribeTaskDefinition`, `ecs:RegisterTaskDefinition`, `ecs:UpdateService`, `iam:PassRole` on the ECS task execution role (condition: `iam:PassedToService=ecs-tasks.amazonaws.com`), `ssm:PutParameter` on `/{APP_NAME}/<env>/current-image` |
+| Frontend, repo-level | Any ref/environment in this repo | Read/write/list on the artifacts bucket, `ssm:GetParameter` on `/{APP_NAME}/*/frontend/current-build` |
+| Frontend, per environment | `environment:<name>` only | Read/write/list on that environment's website bucket, read on the artifacts bucket, `cloudfront:CreateInvalidation` on that environment's distribution, `ssm:GetParameter`/`PutParameter` on `/{APP_NAME}/<env>/frontend/current-build` |
+
+Trust policy condition, per role:
+```
+"StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
+"StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<ORG>@*/<REPO>@*:*" }                          // repo-level
+"StringLike":   { "token.actions.githubusercontent.com:sub": "repo:<ORG>@*/<REPO>@*:environment:<name>" }        // per environment
+```
+
+> **Org-specific note**: if your GitHub organization customizes its OIDC subject claim to embed numeric org/repo IDs (some do, to survive renames) — check by looking at an existing working role's trust policy, or by inspecting a successful `AssumeRoleWithWebIdentity` call in AWS CloudTrail (`userIdentity.userName` shows the exact `sub` string GitHub sent). If it does, the `sub` pattern above needs `@*` after both the org and repo name, e.g. `repo:<ORG>@*/<REPO>@*:environment:<name>`. Using the plain pattern against a customized org will make every `AssumeRoleWithWebIdentity` call fail silently — the deploy step just times out with an AWS auth error, with nothing pointing at the trust policy as the cause.
+
+### Sample policies
+
+One example of each of the four role types — fill in `<ACCOUNT_ID>`, `<REGION>`, `<APP_NAME>`, and the bucket/repo/distribution names for your project. The env-level examples use `qa` as the sample environment; repeat the same shape for `development`/`staging`/`production` with their own resource names.
+
+**Backend, repo-level** (attach to the role trusted for `repo:<ORG>/<REPO>:*`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcrAuth",
+      "Effect": "Allow",
+      "Action": "ecr:GetAuthorizationToken",
+      "Resource": "*"
+    },
+    {
+      "Sid": "EcrPushAppImage",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchGetImage",
+        "ecr:GetDownloadUrlForLayer"
+      ],
+      "Resource": "arn:aws:ecr:<REGION>:<ACCOUNT_ID>:repository/<ECR_REPOSITORY>"
+    },
+    {
+      "Sid": "SsmReadCurrentImage",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/*/current-image"
+    }
+  ]
+}
+```
+
+**Backend, per environment** (attach to the role trusted for `repo:<ORG>/<REPO>:environment:qa`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "EcsDeploy",
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeServices",
+        "ecs:DescribeTaskDefinition",
+        "ecs:RegisterTaskDefinition",
+        "ecs:UpdateService"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "PassEcsTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::<ACCOUNT_ID>:role/ecsTaskExecutionRole",
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "ecs-tasks.amazonaws.com" }
+      }
+    },
+    {
+      "Sid": "SsmWriteCurrentImage",
+      "Effect": "Allow",
+      "Action": "ssm:PutParameter",
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/qa/current-image"
+    }
+  ]
+}
+```
+
+**Frontend, repo-level** (attach to the role trusted for `repo:<ORG>/<REPO>:*`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ArtifactsBucketReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<FRONTEND_ARTIFACTS_BUCKET>/*"
+    },
+    {
+      "Sid": "ArtifactsBucketList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<FRONTEND_ARTIFACTS_BUCKET>"
+    },
+    {
+      "Sid": "SsmReadCurrentBuild",
+      "Effect": "Allow",
+      "Action": "ssm:GetParameter",
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/*/frontend/current-build"
+    }
+  ]
+}
+```
+
+**Frontend, per environment** (attach to the role trusted for `repo:<ORG>/<REPO>:environment:qa`):
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ReadArtifactsBucket",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::<FRONTEND_ARTIFACTS_BUCKET>/*"
+    },
+    {
+      "Sid": "ListArtifactsBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<FRONTEND_ARTIFACTS_BUCKET>"
+    },
+    {
+      "Sid": "WebsiteBucketReadWrite",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::<FRONTEND_S3_BUCKET_QA>/*"
+    },
+    {
+      "Sid": "ListWebsiteBucket",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::<FRONTEND_S3_BUCKET_QA>"
+    },
+    {
+      "Sid": "CloudFrontInvalidate",
+      "Effect": "Allow",
+      "Action": "cloudfront:CreateInvalidation",
+      "Resource": "arn:aws:cloudfront::<ACCOUNT_ID>:distribution/<CLOUDFRONT_DISTRIBUTION_ID>"
+    },
+    {
+      "Sid": "SsmReadWriteCurrentBuild",
+      "Effect": "Allow",
+      "Action": ["ssm:GetParameter", "ssm:PutParameter"],
+      "Resource": "arn:aws:ssm:<REGION>:<ACCOUNT_ID>:parameter/<APP_NAME>/qa/frontend/current-build"
+    }
+  ]
+}
+```
+
+### GitHub configuration
+
+**Repository-level** (Settings → Secrets and variables → Actions):
+
+| Name | Type | Used for |
+| --- | --- | --- |
+| `AWS_ROLE_ARN` | Secret | Backend repo-level role |
+| `AWS_REGION` | Variable | Backend AWS region |
+| `ECR_REPOSITORY` | Variable | Backend image repo name |
+| `FRONTEND_AWS_ROLE_ARN` | Secret | Frontend repo-level role |
+| `FRONTEND_ARTIFACTS_BUCKET` | Variable | Frontend build artifacts bucket |
+| `APP_NAME` | Variable | Namespace prefix for S3 paths + SSM parameter paths (shared by both pipelines) |
+| `GOVERNANCE_AWS_ROLE_ARN` | Secret | Jeavio Governance tool (see below) |
+| `GOVERNANCE_AWS_REGION` | Variable (optional) | Defaults to `ap-south-1` |
+| `COVERAGE_THRESHOLD` | Variable (optional) | Minimum test coverage %, defaults to `80` |
+| `NODE_VERSION` / `PYTHON_VERSION` / `PIP_VERSION` | Variable (optional) | Toolchain versions, sensible defaults if unset |
+
+Only redeclare a variable at the environment level if its value actually differs per environment — anything set at repo level already applies everywhere by default.
+
+**Per GitHub Environment** (Settings → Environments → create `development`, `qa`, `staging`, `production`):
+
+| Name | Type | Used for |
+| --- | --- | --- |
+| `AWS_ROLE_ARN` | Secret | Backend role scoped to this environment |
+| `ECS_CLUSTER`, `ECS_SERVICE`, `ECS_TASK_DEFINITION_FAMILY`, `CONTAINER_NAME` | Variable | This environment's ECS target |
+| `FRONTEND_AWS_ROLE_ARN` | Secret | Frontend role scoped to this environment |
+| `FRONTEND_S3_BUCKET`, `CLOUDFRONT_DISTRIBUTION_ID` | Variable | This environment's website bucket + distribution |
+
+## Checks & where to find reports
+
+Every PR into `develop`/`main`/`release/**` runs, per pipeline: **lint**, **unit tests + coverage** (gated by `COVERAGE_THRESHOLD`), and four security/quality scans via the shared Jeavio Governance tool — **secret detection**, **SAST**, **dependency vulnerability scan**, and **license compliance scan**. A `quality-gate` job fails the PR if anything above failed, was cancelled, or was skipped.
+
+To review results: open the PR's checks (or the workflow run directly) → **Summary** tab → **Artifacts**. Look for `coverage-report`, `secret-detection-reports`, `sast-scan-reports`, `dependency-scan-reports`, `license-scan-reports` (frontend jobs suffix these with `-frontend`; 14-day retention). Note that `secret-detection-reports` can contain the actual secret values found — restrict who can download Actions artifacts if that's a concern.
+
+Governance scans require their own repo-level secret (`GOVERNANCE_AWS_ROLE_ARN`, table above) — this is a separate AWS account/role from either deploy pipeline's.
+
+For branch protection, require the `Quality Gate` job (not every individual check) as a required status check on `develop`/`main`/`release/**` — it already aggregates everything else. Don't mark the frontend check as required until you've confirmed your branch protection rule tolerates a check that only runs on PRs touching `frontend/**`.
+
+## Rollback & traceability
+
+- **Backend**: ECS's own Deployment Circuit Breaker auto-reverts a deploy if new tasks never reach a healthy steady state. `promote-to-production.yml` additionally force-redeploys the previous task definition if the promotion job itself fails.
+- **Frontend**: no infra-level equivalent (static hosting) — `promote-to-production-frontend.yml` force-resyncs the previous build and re-invalidates CloudFront on failure.
+- **What's live where**: every deploy writes to SSM Parameter Store — `/{APP_NAME}/{environment}/current-image` (backend) and `/{APP_NAME}/{environment}/frontend/current-build` (frontend) — as an audit trail, independent of which workflow run did the deploying.
